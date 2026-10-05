@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+application_dir=${ANYSHORTCUT_APPLICATIONS_DIR:-/Applications}
+destination="$application_dir/AnyShortcut.app"
+bundle="$project_dir/.build/AnyShortcut.app"
+
+if /usr/bin/pgrep -f "^$destination/Contents/MacOS/AnyShortcut([[:space:]]|$)" >/dev/null; then
+    echo 'Quit AnyShortcut before deploying an update.' >&2
+    exit 1
+fi
+if [[ -e "$destination" ]]; then
+    installed_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$destination/Contents/Info.plist")
+    if [[ "$installed_id" != 'com.mevanlc.AnyShortcut' ]]; then
+        echo "Refusing to replace an unrelated app at $destination" >&2
+        exit 1
+    fi
+fi
+
+swift build --package-path "$project_dir" --configuration release
+binary_dir=$(swift build --package-path "$project_dir" --configuration release --show-bin-path)
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+cp "$binary_dir/AnyShortcut" "$bundle/Contents/MacOS/AnyShortcut"
+cp "$project_dir/Resources/Info.plist" "$bundle/Contents/Info.plist"
+
+signing_identity=${CODE_SIGN_IDENTITY:-}
+if [[ -z "$signing_identity" ]]; then
+    signing_identity=$(/usr/bin/security find-identity -v -p codesigning |
+        /usr/bin/awk '/"Apple Development:/ { print $2; exit }')
+    signing_identity=${signing_identity:--}
+fi
+/usr/bin/codesign --force --sign "$signing_identity" --options runtime \
+    --entitlements "$project_dir/Resources/AnyShortcut.entitlements" "$bundle"
+/usr/bin/codesign --verify --deep --strict "$bundle"
+
+mkdir -p "$application_dir"
+staging_dir=$(mktemp -d "$application_dir/.AnyShortcut-install.XXXXXX")
+cleanup() {
+    if [[ -d "$staging_dir/previous.app" && ! -e "$destination" ]]; then
+        mv "$staging_dir/previous.app" "$destination"
+    fi
+    rm -rf -- "$staging_dir"
+}
+trap cleanup EXIT
+/usr/bin/ditto "$bundle" "$staging_dir/AnyShortcut.app"
+/usr/bin/codesign --verify --deep --strict "$staging_dir/AnyShortcut.app"
+if [[ -e "$destination" ]]; then
+    mv "$destination" "$staging_dir/previous.app"
+fi
+mv "$staging_dir/AnyShortcut.app" "$destination"
+echo "Installed $destination"
